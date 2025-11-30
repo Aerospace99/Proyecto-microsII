@@ -24,7 +24,7 @@ unsigned long lastDisplayUpdate = 0;
 unsigned long lastBuzzerTime = 0;
 bool buzzerActive = false;
 bool screenLocked = false;
-float Inf = 0.0;  // Inicializar Inf en 0
+float Inf = 0.0;
 const int frecuencia = 2000;
 const int duracionTono = 100;
 const int pausaEntreTonos = 900;
@@ -36,13 +36,19 @@ int SAMPLESNUMBER = 100;
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// Variables para control de tiempo
 unsigned long lastInfusionTime = 0;
-unsigned long infusionInterval = 0;  // Intervalo en milisegundos (45 segundos)
+unsigned long infusionInterval = 0;
 
-// Prototipos de función
+int ultimoEstadoPIC = -1;
+unsigned long ultimoTiempoPIC = 0;
+
+bool enCalibracion = false;
+bool finDeCarrera = false;
+
 void displayWarning(String message);
+void displayWarning2(String message);
 float getCorriente(int samplesNumber);
+float getVoltaje(int samplesNumber);
 void calibrateMotor();
 void stepMotor();
 void infuseVolume(float mlPerHour);
@@ -53,6 +59,58 @@ void manageBuzzer();
 void updateDisplayIfNeeded();
 void checkSerialInput();
 void setDelay(float mlPerHour);
+float leerInf();
+void emitirBuzzer();
+
+void beepSimple(int duracionMs) {
+  unsigned long inicio = millis();
+  while (millis() - inicio < (unsigned long)duracionMs) {
+    digitalWrite(pinBuzzer, HIGH);
+    delayMicroseconds(500);
+    digitalWrite(pinBuzzer, LOW);
+    delayMicroseconds(500);
+  }
+}
+
+void leerEstadoPIC() {
+  bool recibio = false;
+
+  while (Serial2.available() > 0) {
+    char c = Serial2.read();
+    recibio = true;
+    ultimoTiempoPIC = millis();
+
+    if (c == 'A') {
+      ultimoEstadoPIC = 1;
+      Serial.println("PIC: JERINGA DETECTADA (A)");
+    }
+    else if (c == 'S') {
+      ultimoEstadoPIC = 0;
+      Serial.println("PIC: JERINGA NO DETECTADA (S)");
+    }
+  }
+
+  if (!recibio && millis() - ultimoTiempoPIC >= 1000) {
+    if (ultimoEstadoPIC == 1) {
+      Serial.println("PIC (repetido): JERINGA DETECTADA");
+    }
+    else if (ultimoEstadoPIC == 0) {
+      Serial.println("PIC (repetido): JERINGA NO DETECTADA");
+    }
+    ultimoTiempoPIC = millis();
+  }
+}
+
+void aplicarLogicaPIC() {
+  if (ultimoEstadoPIC == 0) {
+    digitalWrite(MOTOR_CONTROL_PIN, HIGH);
+  }
+  else if (ultimoEstadoPIC == 1) {
+    if (!finDeCarrera) {
+      digitalWrite(MOTOR_CONTROL_PIN, LOW);
+    }
+  }
+}
 
 void setup() {
   pinMode(pinPower1, OUTPUT);
@@ -75,13 +133,12 @@ void setup() {
   pinMode(SWITCH_LEFT_PIN, INPUT_PULLUP);
 
   Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, 16, -1);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("No se encuentra la pantalla OLED"));
-    while (true) {
-      delay(100);
-    }
+    while (true) { delay(100); }
   }
+
   display.display();
   delay(2000);
   display.clearDisplay();
@@ -92,12 +149,13 @@ void setup() {
 }
 
 void loop() {
-  checkSerialInput();  // Chequea si hay un nuevo valor en el monitor serial
+  leerEstadoPIC();
+  aplicarLogicaPIC();
+  checkSerialInput();
 
   unsigned long currentTime = millis();
 
-  // Ejecutar handleInfusion() cada 45 segundos
-  if (currentTime - lastInfusionTime >= infusionInterval && Inf>0) {
+  if (currentTime - lastInfusionTime >= infusionInterval && Inf > 0) {
     handleInfusion();
     lastInfusionTime = currentTime;
   }
@@ -108,19 +166,24 @@ void loop() {
 }
 
 void checkSerialInput() { 
-if (Serial.available() > 0) {
-  String command = Serial.readStringUntil('\n');
-  if (command == "RESET") { 
-    ESP.restart(); }
-    else{ // Leer la línea de datos desde el monitor serial 
-    float valorRecibido = command.toFloat();
-    if (valorRecibido != 0.0) { 
-      Inf = valorRecibido;
-      setDelay(Inf); 
-      Serial.print("Nuevo valor de Inf: "); 
-      Serial.println(Inf); } } } }
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    if (command == "RESET") { 
+      ESP.restart(); 
+    } else { 
+      float valorRecibido = command.toFloat();
+      if (valorRecibido != 0.0) { 
+        Inf = valorRecibido;
+        setDelay(Inf); 
+      } 
+    } 
+  } 
+}
 
 void calibrateMotor() {
+  enCalibracion = true;
+  finDeCarrera = false;
+
   digitalWrite(DIR_PIN, HIGH);
   while (digitalRead(SWITCH_RIGHT_PIN) == HIGH) {
     stepMotor();
@@ -130,11 +193,30 @@ void calibrateMotor() {
   while (digitalRead(SWITCH_LEFT_PIN) == HIGH) {
     stepMotor();
   }
-  Serial.println("Calibración completa");
   digitalWrite(DIR_PIN, HIGH);
+
+  enCalibracion = false;
 }
 
 void stepMotor() {
+  if (finDeCarrera && !enCalibracion) return;
+  if (ultimoEstadoPIC == 0 && !enCalibracion) return;
+
+  if (!enCalibracion) {
+    if (digitalRead(DIR_PIN) == HIGH && digitalRead(SWITCH_RIGHT_PIN) == LOW) {
+      finDeCarrera = true;
+      triggerBuzzer("LIMITE DERECHO");
+      screenLocked = true;
+      return;
+    }
+    if (digitalRead(DIR_PIN) == LOW && digitalRead(SWITCH_LEFT_PIN) == LOW) {
+      finDeCarrera = true;
+      triggerBuzzer("LIMITE IZQUIERDO");
+      screenLocked = true;
+      return;
+    }
+  }
+
   digitalWrite(STEP_PIN, HIGH);
   delayMicroseconds(1000);
   digitalWrite(STEP_PIN, LOW);
@@ -143,15 +225,16 @@ void stepMotor() {
 
 void setDelay(float mlPerHour) {
   int segMl = (1.0/mlPerHour)*3600000;
-  infusionInterval = (5*segMl)/200;
+  infusionInterval = (5 * segMl) / 200;
 }
 
 void handleInfusion() {
+  if (ultimoEstadoPIC == 0) return;
+  if (finDeCarrera) return;
+
   for (int i = 0; i < 5; i++){ 
-    digitalWrite(STEP_PIN, HIGH);
-    delayMicroseconds(1000);
-    digitalWrite(STEP_PIN, LOW);
-    delayMicroseconds(1000);}
+    stepMotor();
+  }
 }
 
 void monitorSensors() {
@@ -166,23 +249,25 @@ void monitorSensors() {
   } else if (valorLectura >= umbral) {
     buzzerActive = false;
     screenLocked = false;
-
   }
+
   if (Voltaje < 10 || current < 0.05) {
     triggerBuzzer("Alimentacion insuficiente");
     digitalWrite(MOTOR_CONTROL_PIN, HIGH);
     screenLocked = true;
   } else if (Voltaje > 12) {
-      displayWarning2("VOLTAJE POR ENCIMA DEL LIMITE, INFUSION DETENIDA");
-      while (true){
-        emitirBuzzer();
-        delay(500);
-        if (getVoltaje(SAMPLESNUMBER)<12){
-          break;
-    }
+    displayWarning2("VOLTAJE POR ENCIMA DEL LIMITE, INFUSION DETENIDA");
+    while (true){
+      emitirBuzzer();
+      delay(500);
+      if (getVoltaje(SAMPLESNUMBER) < 12){
+        break;
       }
+    }
   } else {
-    digitalWrite(MOTOR_CONTROL_PIN, LOW);
+    if (!finDeCarrera && ultimoEstadoPIC == 1) {
+      digitalWrite(MOTOR_CONTROL_PIN, LOW);
+    }
     display.ssd1306_command(SSD1306_DISPLAYON);
     screenLocked = false;
   }
@@ -195,17 +280,13 @@ void triggerBuzzer(String mensaje) {
 
 void manageBuzzer() {
   if (buzzerActive && (millis() - lastBuzzerTime) >= pausaEntreTonos) {
-    tone(pinBuzzer, frecuencia, duracionTono);
+    beepSimple(duracionTono);
     lastBuzzerTime = millis();
-  } else {
-    noTone(pinBuzzer);
   }
 }
 
 void updateDisplayIfNeeded() {
-  if (screenLocked) {
-    return;
-  }
+  if (screenLocked) return;
 
   if (millis() - lastDisplayUpdate >= displayUpdateInterval && !buzzerActive) {
     display.clearDisplay();
@@ -243,11 +324,11 @@ float getCorriente(int samplesNumber) {
 float getVoltaje(int samplesNumber) {
   float voltajeSum = 0;
   for (int i = 0; i < samplesNumber; i++) {
-    float voltage = analogRead(pinVoltaje) * 3.0 / 4095.0;  // Conversión de lectura ADC a voltaje (3V)
+    float voltage = analogRead(pinVoltaje) * 3.0 / 4095.0;
     voltajeSum += voltage;
   }
   float voltajeMedido = voltajeSum / samplesNumber;
-  float voltajeReal = voltajeMedido * factorEscala;  // Escala al voltaje real (12V máximo)
+  float voltajeReal = voltajeMedido * factorEscala;
   return voltajeReal;
 }
 
@@ -270,12 +351,10 @@ void displayWarning2(String message) {
 }
 
 float leerInf() {
-  // Leer y convertir el dato recibido a float
   float datoRecibido = Serial.parseFloat();
   return datoRecibido;
 }
 
 void emitirBuzzer() {
-  const int frecuencia = 2000;  // Frecuencia del sonido en Hz
-  const int duracion = 500;  // Duración del sonido en ms
-  tone(pinBuzzer, frecuencia, duracion); } // Generar un tono en el buz
+  beepSimple(500);
+}
